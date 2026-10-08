@@ -1,0 +1,23 @@
+{
+  "name": "animation-studio",
+  "version": "1.0.0",
+  "description": "Motion graphics studio: films rendered from code with Claude Code",
+  "scripts": {
+    "setup:browser": "playwright install chromium"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nethr-de/animation-studio.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/nethr-de/animation-studio/issues"
+  },
+  "homepage": "https://github.com/nethr-de/animation-studio#readme",
+  "devDependencies": {
+    "playwright": "^1.64.0"
+  },
+  "private": true
+}
