@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Kindermann Catering, 20 s loop</title>
+<style>
+  @font-face { font-family: "Zilla Slab"; font-weight: 600; src: url("../../assets/kindermann/fonts/zilla-slab-latin-600-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Source Sans 3"; font-weight: 200 900; src: url("../../assets/kindermann/fonts/source-sans-3-latin-wght-normal.woff2") format("woff2"); }
+  :root {
+    --weiss: #ffffff; --grau: #ebecee; --linie: #c9cacd;
+    --text: #4a4a4a; --dunkel: #222222; --leise: #5f5f5f;
+    --rot: #ba1024; --rot-dunkel: #950c1c; --punkt: #8c8c8c;
+    --serif: "Zilla Slab", Georgia, serif;
+    --sans: "Source Sans 3", system-ui, sans-serif;
+  }
+  html, body { margin: 0; background: #fff; }
+  #stage { position: relative; overflow: hidden; background: var(--weiss); }
+  .page { position: absolute; left: 0; top: 0; overflow: hidden; will-change: transform; }
+  .abs { position: absolute; }
+  .win { position: absolute; overflow: hidden; background: var(--grau); }
+  .win img { position: absolute; left: 0; top: 0; transform-origin: 0 0; display: block; }
+  .line { position: absolute; overflow: hidden; white-space: nowrap; }
+  .line > span { display: inline-block; will-change: transform; }
+  .serif { font-family: var(--serif); font-weight: 600; color: var(--dunkel); }
+  .sans { font-family: var(--sans); color: var(--dunkel); }
+  .rot { color: var(--rot); }
+  .dot { display: inline-block; transform-origin: 50% 85%; }
+  .leader { position: absolute; overflow: hidden; }
+  .leader > i { position: absolute; left: 0; top: 0; bottom: 0; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script>
+// Kindermann Catering, 20 s seamless loop. A pure function of time: seek(t) paints frame t.
+// No transitions, timers or rAF. Every move is a closed-form spring or a constant-speed camera.
+
+const FORMATS = { '3x4': [1080, 1440], '9x16': [1080, 1920], '16x9': [1920, 1080] };
+const fmt = new URLSearchParams(location.search).get('fmt') || '3x4';
+const [W, H] = FORMATS[fmt];
+const LAND = W > H;
+const DUR = 20;
+const IMG = '../../assets/kindermann/img/';
+const MAX_SCALE = 0.98;            // never show a photo at more than 0.98 screen px per source px
+
+// ---------- time and springs ----------
+let BEATS = [];                    // measured grid from beats.json (falls back to 96 BPM)
+const beat = (n) => {
+  const i = Math.floor(n), f = n - i;
+  const a = BEATS[i] ?? i * 0.625, b = BEATS[i + 1] ?? (i + 1) * 0.625;
+  return a + (b - a) * f;
+};
+// closed-form damped harmonic oscillator, 0 -> 1. f in Hz, z damping ratio
+function spring(t, f = 2, z = 0.7) {
+  if (t <= 0) return 0;
+  const w = 2 * Math.PI * f;
+  if (z >= 1) return 1 - Math.exp(-w * t) * (1 + w * t);
+  const wd = w * Math.sqrt(1 - z * z);
+  return 1 - Math.exp(-z * w * t) * (Math.cos(wd * t) + (z * w / wd) * Math.sin(wd * t));
+}
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+// ---------- DOM helpers ----------
+const stage = document.getElementById('stage');
+stage.style.width = W + 'px'; stage.style.height = H + 'px';
+function el(tag, cls, parent, css = {}) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  Object.assign(e.style, css);
+  (parent || stage).appendChild(e);
+  return e;
+}
+function page(bg) {
+  return el('div', 'page', stage, { width: W + 'px', height: H + 'px', background: bg });
+}
+const px = (v) => v + 'px';
+let measureCtx;
+function textWidth(text, font) {
+  measureCtx = measureCtx || document.createElement('canvas').getContext('2d');
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+function fitSize(lines, family, weight, maxW, maxSize) {
+  let w = 0;
+  for (const l of lines) w = Math.max(w, textWidth(l, `${weight} 100px "${family}"`));
+  return Math.min(maxSize, Math.floor(100 * maxW / w));
+}
+// A line of text that rises into a mask. Pieces: [[text, cls], ...]
+function maskLine(parent, x, y, size, pieces, cls, lh = 1.22) {
+  const box = el('div', 'line ' + cls, parent, {
+    left: px(x), top: px(y - size * 0.08), height: px(size * lh), fontSize: px(size), lineHeight: px(size * lh),
+    paddingRight: px(size * 0.2),
+  });
+  const inner = el('span', '', box);
+  const parts = [];
+  for (const [t, c] of pieces) {
+    const s = el('span', c || '', inner);
+    s.textContent = t;
+    parts.push(s);
+  }
+  return { box, inner, parts, size };
+}
+function rise(line, t0, t, f = 2.1, z = 0.62) {
+  const k = spring(t - t0, f, z);
+  line.inner.style.transform = `translateY(${(1 - k) * 112}%)`;
+  line.box.style.visibility = t >= t0 ? 'visible' : 'hidden';
+}
+// photo window with a camera. cam: {s0,s1,c0:[x,y],c1:[x,y]} in source px space (centre of view)
+function photo(parent, src, iw, ih, x, y, w, h) {
+  const win = el('div', 'win', parent, { left: px(x), top: px(y), width: px(w), height: px(h) });
+  const img = el('img', '', win, { width: px(iw), height: px(ih) });
+  img.src = IMG + src;
+  return { win, img, iw, ih, w, h, src };
+}
+const camLog = [];
+// cam: {s0, s1, u0: [ux, uy], u1: [ux, uy]}. u is the position inside the slack: 0 = left/top edge, 1 = right/bottom.
+function camera(p, cam, k) {
+  const s = lerp(cam.s0, cam.s1, k);
+  const ux = lerp(cam.u0[0], cam.u1[0], k), uy = lerp(cam.u0[1], cam.u1[1], k);
+  const tx = -ux * (p.iw * s - p.w), ty = -uy * (p.ih * s - p.h);
+  const uncovered = p.iw * s < p.w - 0.01 || p.ih * s < p.h - 0.01;
+  camLog.push({ src: p.src, s, clamped: uncovered, tooBig: s > MAX_SCALE + 1e-6 });
+  p.img.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+}
+
+// ---------- layout per format ----------
+const M = LAND ? 120 : 90;
+const L = {};
+function buildLayout() {
+  // Hook: three stacked words, as big as the frame allows
+  const hookWords = ['Gutes', 'Essen', 'Hausgemacht'];
+  // a lockup: every word set to the same width, so the short words get huge
+  const ADV = 0.9;
+  const unit = hookWords.map((w) => 100 / textWidth(w + '.', '600 100px "Zilla Slab"'));   // size per px of width
+  const heightPerW = (u) => u.reduce((a, k, i) => a + k * (i < u.length - 1 ? ADV : 0.8), 0);
+  let lockW = W - 2 * M;
+  lockW = Math.min(lockW, (H - (LAND ? 300 : 2 * M)) / heightPerW(unit));
+  L.hookSizes = unit.map((k) => Math.floor(k * lockW));
+  L.hookYs = [];
+  let hy = (H - heightPerW(unit) * lockW) / 2 - L.hookSizes[0] * 0.1;
+  for (const sz of L.hookSizes) { L.hookYs.push(hy); hy += sz * ADV; }
+  L.hookX = LAND ? (W - lockW) / 2 : M;
+  L.hookWords = hookWords;
+
+  // Logo: native size at most (560 x 147), aligned with the hook's first line
+  L.logoW = 560; L.logoH = 147;
+  L.logoX = Math.round((W - L.logoW) / 2); L.logoY = Math.round((H - L.logoH) / 2);
+
+  // Food: album window + caption
+  if (LAND) {
+    L.food = { x: W - M - 780, y: 70, w: 780, h: 940 };
+    L.foodCap = { x: M, size: 90, maxW: W - 2 * M - 780 - 80, serif: true };
+  } else {
+    const w = 800, h = 1040;
+    const y = fmt === '9x16' ? 360 : 140;
+    L.food = { x: (W - w) / 2, y, w, h };
+    L.foodCap = { x: (W - w) / 2, y: y + h + 34, size: 54, serif: false };
+  }
+  // Occasions: photo window + one big word
+  if (LAND) {
+    L.occ = { x: M, y: 115, w: 680, h: 850 };
+    L.occWord = { x: M + 680 + 110, maxW: W - (M + 680 + 110) - M };
+  } else {
+    L.occ = { x: W - M - 720, y: fmt === '9x16' ? 350 : 110, w: 720, h: 900 };
+    L.occWord = { x: M, maxW: W - 2 * M };
+  }
+  L.occSize = fitSize(['Private Feier', 'Firmenfeier', 'Hochzeit'], 'Zilla Slab', 600, L.occWord.maxW, LAND ? 190 : 175);
+  L.occWord.y = LAND ? L.occ.y + L.occ.h - L.occSize * 1.0 : L.occ.y + L.occ.h + (fmt === '9x16' ? 110 : 70);
+
+  // Menu card
+  L.card = LAND ? { x: 260, y: 96, w: W - 520 } : { x: 60, y: fmt === '9x16' ? 300 : 150, w: W - 120 };
+  L.cardPad = LAND ? 72 : 60;
+  L.cardHead = LAND ? 230 : 380;
+
+  // Seit mehr als 20 Jahren: the long table, the only photo wide enough to bleed
+  if (LAND) {
+    L.tafel = { x: W - 960, y: 0, w: 960, h: H };
+    L.seit = { x: M, maxW: W - 960 - 2 * M };
+  } else {
+    L.tafel = { x: 0, y: 0, w: W, h: fmt === '9x16' ? 1340 : 980 };
+    L.seit = { x: M, maxW: W - 2 * M };
+  }
+  L.seitSize = fitSize(['Seit mehr als', '20 Jahren'], 'Zilla Slab', 600, L.seit.maxW, LAND ? 150 : 132);
+
+  // Sie feiern - wir catern!
+  L.feiernSize = fitSize(['Sie feiern -', 'wir catern!'], 'Zilla Slab', 600, W - 2 * M - (LAND ? 300 : 0), LAND ? 220 : 200);
+}
+
+// ---------- scenes ----------
+const S = {};
+function build() {
+  buildLayout();
+
+  // L: logo on white. First and last frame.
+  S.logo = page('var(--weiss)');
+  S.logoImg = el('img', 'abs', S.logo, { left: px(L.logoX), top: px(L.logoY), width: px(L.logoW), height: px(L.logoH) });
+  S.logoImg.src = IMG + 'logo-kindermann-catering.png';
+
+  // A: hook
+  S.hook = page('var(--weiss)');
+  S.hookLines = L.hookWords.map((w, i) =>
+    maskLine(S.hook, L.hookX - L.hookSizes[i] * 0.045, L.hookYs[i], L.hookSizes[i], [[w, ''], ['.', 'dot rot']], 'serif', 1.06));
+
+  // B: food
+  S.food = page('var(--weiss)');
+  const F = L.food;
+  const foods = [
+    { src: 'album-bruschetta-900.webp', cap: 'Bruschetta und Löffel-Häppchen',
+      cam: { s0: 0.90, s1: 0.97, u0: [0.5, 0.5], u1: [0.85, 0.9] } },
+    { src: 'album-caprese-900.webp', cap: 'Tomate und Mozzarella',
+      cam: { s0: 0.96, s1: 0.96, u0: [0.9, 0.7], u1: [0.1, 0.3] } },
+    { src: 'album-pfaelzisch-900.webp', cap: 'Pfälzer Kartoffelsalat mit Fleischpflanzerl',
+      cam: { s0: 0.90, s1: 0.97, u0: [0.5, 0.5], u1: [0.15, 0.85] } },
+    { src: 'album-dessert-900.webp', cap: 'Desserts im Glas',
+      cam: { s0: 0.97, s1: 0.97, u0: [0.1, 0.9], u1: [0.9, 0.2] } },
+  ];
+  S.foods = foods.map((f) => {
+    const p = photo(S.food, f.src, 900, 1200, F.x, F.y, F.w, F.h);
+    // caption wrapped to the column it lives in (landscape: Zilla headline left; portrait: under the photo)
+    const capFont = L.foodCap.serif ? `600 ${L.foodCap.size}px "Zilla Slab"` : `600 ${L.foodCap.size}px "Source Sans 3"`;
+    const maxW = L.foodCap.serif ? L.foodCap.maxW : F.w;
+    const lines = [];
+    let cur = '';
+    for (const w of f.cap.split(' ')) {
+      const tryL = cur ? cur + ' ' + w : w;
+      if (textWidth(tryL, capFont) > maxW && cur) { lines.push(cur); cur = w; } else cur = tryL;
+    }
+    lines.push(cur);
+    const lh = L.foodCap.size * (L.foodCap.serif ? 1.12 : 1.22);
+    const y0 = L.foodCap.serif ? F.y + F.h - lines.length * lh : L.foodCap.y;
+    const cap = lines.map((t, i) => {
+      const l = maskLine(S.food, L.foodCap.serif ? M : L.foodCap.x, y0 + i * lh, L.foodCap.size, [[t, '']], L.foodCap.serif ? 'serif' : 'sans', L.foodCap.serif ? 1.12 : 1.25);
+      if (!L.foodCap.serif) l.box.style.fontWeight = 600;
+      return l;
+    });
+    return { ...f, p, cap };
+  });
+
+  // C: occasions, on the site's grey
+  S.occ = page('var(--grau)');
+  const O = L.occ;
+  const occs = [
+    { src: 'anlass-hochzeit-800.webp', word: 'Hochzeit', cam: { s0: 0.90, s1: 0.98, u0: [0.5, 0.5], u1: [0.2, 0.3] } },
+    { src: 'anlass-privat-800.webp', word: 'Private Feier', cam: { s0: 0.96, s1: 0.96, u0: [0.9, 0.3], u1: [0.1, 0.7] } },
+    { src: 'anlass-firma-800.webp', word: 'Firmenfeier', cam: { s0: 0.98, s1: 0.90, u0: [0.5, 0.4], u1: [0.5, 0.5] } },
+  ];
+  // prints laid on the table: each slides in on a spring and lands a little offset from the last
+  S.occs = occs.map((o, i) => ({
+    ...o,
+    xf: O.x + (LAND ? 1 : -1) * (2 - i) * 34,
+    xs: LAND ? -O.w - 40 : W + 40,
+    p: photo(S.occ, o.src, 800, 1000, O.x, O.y, O.w, O.h),
+    line: maskLine(S.occ, L.occWord.x - L.occSize * 0.03, L.occWord.y, L.occSize, [[o.word, '']], 'serif', 1.15),
+  }));
+
+  // D: menu card
+  S.menu = page('var(--grau)');
+  const C = L.card, P = L.cardPad;
+  S.cardBody = el('div', 'abs', S.menu, { left: px(C.x), top: px(C.y), width: px(C.w), background: '#fff', border: '2px solid var(--linie)', boxSizing: 'border-box' });
+  S.cardHeadClip = el('div', 'abs', S.menu, { left: px(C.x), top: px(C.y), width: px(C.w), height: px(L.cardHead), overflow: 'hidden' });
+  S.cardHead = el('div', 'abs', S.cardHeadClip, { left: 0, top: 0, width: px(C.w), height: px(L.cardHead), background: 'var(--rot)' });
+  const hSize = LAND ? 124 : 128;
+  S.cardTitle = el('div', 'abs serif', S.cardHead, { left: px(P), top: px(LAND ? 58 : 52), fontSize: px(hSize), lineHeight: 1, color: '#fff' });
+  S.cardTitle.textContent = 'Menükarte';
+  const noteSize = LAND ? 38 : 44;
+  S.cardNote = el('div', 'abs sans', S.cardHead, {
+    left: px(LAND ? C.w - P - 600 : P), top: px(LAND ? 84 : 52 + hSize + 26), width: px(LAND ? 600 : C.w - 2 * P),
+    fontSize: px(noteSize), lineHeight: 1.35, color: '#fff', textAlign: LAND ? 'right' : 'left',
+  });
+  S.cardNote.textContent = 'Preise aus unserer Bankettmappe, zzgl. gesetzlicher MwSt.';
+  let y = C.y + L.cardHead + P - 6;
+  const h3 = LAND ? 70 : 72;
+  S.menuH3 = maskLine(S.menu, C.x + P, y, h3, [['Buffets und Menüs ', ''], ['pro Person', 'proPerson']], 'serif', 1.2);
+  S.menuH3.parts[1].style.cssText = `font-family: var(--sans); font-weight: 400; color: var(--leise); font-size: ${Math.round(h3 * 0.7)}px;`;
+  y += h3 * 1.2 + (LAND ? 40 : 46);
+  const items = [['Klassiker', 'ab 25,50 €'], ['Live-Cooking', 'ab 27,50 €'], ['Fingerfood', 'ab 11,00 €']];
+  const iSize = LAND ? 74 : 70;
+  const rowH = LAND ? 132 : 150;
+  S.items = items.map(([name, price], i) => {
+    const yy = y + i * rowH;
+    const nw = textWidth(name, `600 ${iSize}px "Source Sans 3"`);
+    const pw = textWidth(price, `600 ${iSize}px "Source Sans 3"`);
+    const nameL = maskLine(S.menu, C.x + P, yy, iSize, [[name, '']], 'sans', 1.25);
+    const priceL = maskLine(S.menu, C.x + C.w - P - pw, yy, iSize, [[price, '']], 'sans', 1.25);
+    nameL.box.style.fontWeight = 600; priceL.box.style.fontWeight = 600;
+    priceL.box.style.paddingRight = '0px';
+    const gap = iSize * 0.28;
+    const lx = C.x + P + nw + gap, lw = (C.x + C.w - P - pw - gap) - lx;
+    if (lw < 90) console.warn('leader too short', name, lw);
+    const leader = el('div', 'leader', S.menu, { left: px(lx), top: px(yy + iSize * 0.84), height: px(8), width: px(lw) });
+    const dots = el('i', '', leader, {
+      width: px(lw),
+      backgroundImage: 'radial-gradient(circle, var(--punkt) 2.6px, transparent 3.2px)',
+      backgroundSize: '13px 8px', backgroundRepeat: 'repeat-x', backgroundPosition: '0 0',
+    });
+    return { nameL, priceL, leader, lw };
+  });
+  const bodyH = (y + items.length * rowH + P * 0.6) - C.y;
+  S.cardBody.style.height = px(bodyH);
+  L.cardBottom = C.y + bodyH;
+  // vertical centring of the card in the frame
+  const off = Math.round((H - bodyH) / 2 - C.y);
+  for (const ch of S.menu.children) ch.style.top = px(parseFloat(ch.style.top) + off);
+
+  // E: Seit mehr als 20 Jahren
+  S.seit = page('var(--weiss)');
+  const T = L.tafel;
+  S.tafel = photo(S.seit, 'hero-tafel-1200.webp', 1200, 1600, T.x, T.y, T.w, T.h);
+  S.tafel.win.style.background = 'transparent';
+  const sz = L.seitSize, slh = sz * 1.08;
+  const sy = LAND ? (H - 2 * slh) / 2 : T.h + ((H - T.h) - 2 * slh) / 2 - sz * 0.05;
+  S.seitLines = [
+    maskLine(S.seit, L.seit.x - sz * 0.03, sy, sz, [['Seit mehr als', '']], 'serif', 1.12),
+    maskLine(S.seit, L.seit.x - sz * 0.03, sy + slh, sz, [['20 Jahren', '']], 'serif', 1.12),
+  ];
+
+  // F: red surface, Sie feiern - wir catern!
+  S.red = page('var(--rot)');
+  const fs = L.feiernSize, flh = fs * 1.06;
+  const fy = (H - 2 * flh) / 2;
+  S.feiern = [
+    maskLine(S.red, M - fs * 0.03, fy, fs, [['Sie feiern -', '']], 'serif', 1.12),
+    maskLine(S.red, M - fs * 0.03, fy + flh, fs, [['wir catern!', '']], 'serif', 1.12),
+  ];
+  for (const l of S.feiern) l.box.style.color = '#fff';
+}
+
+// ---------- the timeline (beats at 96 BPM: 0.625 s) ----------
+//  b0        logo on white (= last frame)
+//  b1 b2 b3  Gutes. / Essen. / Hausgemacht.   red dots stamp on the off-beat
+//  b5        page scrolls: bruschetta          b7 caprese   b8 Kartoffelsalat   b9 desserts
+//  b11       Hochzeit   b13 Private Feier   b15 Firmenfeier
+//  b17       menu card: red header drops; b17.5 heading; b18 b19 b20 lines draw
+//  b23       page scrolls: Seit mehr als 20 Jahren over the long table
+//  b25.5     red surface rises; b26 Sie feiern -   b27 wir catern!
+//  b29       red lifts away, logo on white. Holds to b32 = frame 0.
+function vis(e, on) { e.style.visibility = on ? 'visible' : 'hidden'; }
+function show(e, on) { e.style.display = on ? 'block' : 'none'; }
+function setY(e, y) { e.style.transform = `translate3d(0, ${y}px, 0)`; }
+
+function seek(t) {
+  camLog.length = 0;
+  const b = beat;
+  // which pages are on screen
+  const scrollAB = spring(t - b(5), 1.55, 0.9);    // hook -> food
+  const scrollDE = spring(t - b(23), 1.55, 0.9);   // menu -> seit
+  const redUp = spring(t - b(25.5), 1.7, 0.86);    // red rises from below
+  const redOff = spring(t - b(29), 1.45, 0.92);    // red lifts off the top
+
+  const inLogoStart = t < b(1);
+  const inHook = t >= b(1) && (t < b(5) || scrollAB < 0.999);
+  const inFood = t >= b(5) && t < b(11);
+  const inOcc = t >= b(11) && t < b(17);
+  const inMenu = t >= b(17) && (t < b(23) || scrollDE < 0.999) && t < b(23) + 1.2;
+  const inSeit = t >= b(23) && t < b(29);
+  const inRed = t >= b(25.5);
+  const inLogoEnd = t >= b(29);
+
+  show(S.logo, inLogoStart || inLogoEnd);
+  setY(S.logo, 0);
+  // the logo settles into place under the lifting red, critically damped, and is exactly 1.0
+  // (native pixels) on the last frame and on frame 0, so the loop seam is invisible
+  {
+    const kEnd = spring(DUR - 1 / 24 - b(29), 0.5, 1);   // reaches 1 on the last rendered frame
+    const k = t >= b(29) ? Math.min(1, spring(t - b(29), 0.5, 1) / kEnd) : 1;
+    S.logoImg.style.transform = k < 1 ? `scale(${0.93 + 0.07 * k})` : 'none';
+  }
+
+  // A: hook
+  show(S.hook, inHook);
+  if (inHook) {
+    setY(S.hook, t >= b(5) ? -H * scrollAB : 0);
+    S.hookLines.forEach((l, i) => {
+      rise(l, b(1 + i), t);
+      const k = spring(t - b(1.5 + i), 2.6, 0.42);
+      l.parts[1].style.transform = `scale(${Math.max(0, k)})`;
+    });
+  }
+
+  // B: food
+  show(S.food, inFood);
+  if (inFood) {
+    setY(S.food, H * (1 - scrollAB));
+    const cuts = [5, 7, 8, 9, 11];
+    S.foods.forEach((f, i) => {
+      const t0 = b(cuts[i]), t1 = b(cuts[i + 1]);
+      const on = t >= t0 && t < t1;
+      vis(f.p.win, on);
+      f.cap.forEach((c, j) => { c.box.style.display = on ? 'block' : 'none'; if (on) rise(c, t0 + (i === 0 ? 0.12 : 0) + j * 0.05, t, 2.3, 0.7); });
+      if (on) camera(f.p, f.cam, (t - t0) / (t1 - t0));
+    });
+  }
+
+  // C: occasions
+  show(S.occ, inOcc);
+  if (inOcc) {
+    setY(S.occ, 0);
+    const cuts = [11, 13, 15, 17];
+    S.occs.forEach((o, i) => {
+      const t0 = b(cuts[i]), t1 = b(cuts[i + 1]);
+      const on = t >= t0 && t < t1;
+      vis(o.p.win, t >= t0);
+      o.line.box.style.display = on ? 'block' : 'none';
+      if (on) rise(o.line, t0 + 0.1, t, 2.0, 0.6);
+      if (t >= t0) {
+        const k = spring(t - t0, 1.45, 0.84);
+        o.p.win.style.left = px(lerp(o.xs, o.xf, k));
+        camera(o.p, o.cam, (t - t0) / (b(17) - t0));
+      }
+    });
+  }
+
+  // D: menu card
+  show(S.menu, inMenu);
+  if (inMenu) {
+    setY(S.menu, t >= b(23) ? -H * scrollDE : 0);
+    const k = spring(t - b(17), 1.9, 0.78);
+    setY(S.cardHead, -L.cardHead * (1 - k));
+    rise(S.menuH3, b(17.5), t, 2.1, 0.7);
+    S.items.forEach((it, i) => {
+      const t0 = b(18 + i);
+      rise(it.nameL, t0, t, 2.2, 0.66);
+      const d = spring(t - (t0 + 0.08), 1.25, 1);
+      it.leader.style.width = px(Math.max(0, it.lw * d));
+      rise(it.priceL, b(18.5 + i), t, 2.4, 0.55);
+    });
+  }
+
+  // E: Seit mehr als 20 Jahren
+  show(S.seit, inSeit);
+  if (inSeit) {
+    setY(S.seit, H * (1 - scrollDE));
+    const k = clamp01((t - b(23)) / (b(29) - b(23)));
+    const cam = LAND
+      ? { s0: 0.80, s1: 0.90, u0: [0.5, 0.55], u1: [0.5, 0.45] }
+      : { s0: 0.90, s1: 0.97, u0: [0.5, 0.55], u1: [0.5, 0.42] };
+    camera(S.tafel, cam, k);
+    rise(S.seitLines[0], b(23) + 0.12, t, 2.0, 0.66);
+    rise(S.seitLines[1], b(24), t, 2.0, 0.66);
+  }
+
+  // F: red surface
+  show(S.red, inRed && redOff < 0.999);
+  if (inRed) {
+    const y = t < b(29) ? H * (1 - redUp) : -H * redOff;
+    setY(S.red, y);
+    rise(S.feiern[0], b(26), t, 2.1, 0.62);
+    rise(S.feiern[1], b(27), t, 2.1, 0.62);
+  }
+  return camLog.slice();
+}
+
+window.seek = seek;
+window.DUR = DUR; window.FMT = fmt; window.W = W; window.H = H;
+window.ready = (async () => {
+  try {
+    const r = await fetch('beats.json');
+    if (r.ok) BEATS = (await r.json()).beats;
+  } catch (e) {}
+  await document.fonts.load('600 100px "Zilla Slab"');
+  await document.fonts.load('600 100px "Source Sans 3"');
+  await document.fonts.load('400 100px "Source Sans 3"');
+  build();
+  await Promise.all([...document.images].map((i) => i.decode().catch(() => {})));
+  seek(0);
+  return { W, H, DUR, fmt, beats: BEATS.length };
+})();
+</script>
+</body>
+</html>
